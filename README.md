@@ -1,229 +1,126 @@
-# Financial News Summarizer
+# Financial News Aggregator
 
-A production-grade API that accepts raw financial news articles and returns structured JSON summaries enriched with key insights, affected companies/sectors, investor implications, and hallucination-risk scores. Powered by OpenRouter.
-
----
-
-## Project Structure
-
-```
-financial-news-summarizer/
-├── main.py                          # FastAPI app entry point
-├── requirements.txt
-├── .env.example                     # Copy to .env and fill in your key
-├── example_request.py               # Runnable client demo
-├── EXAMPLE_RESPONSE.md              # Sample request + response
-│
-├── app/
-│   ├── models.py                    # Pydantic request/response schemas
-│   │
-│   ├── prompts/
-│   │   └── financial_prompts.py     # All LangChain prompt templates
-│   │
-│   ├── routes/
-│   │   └── summarize.py             # POST /api/v1/summarize endpoint
-│   │
-│   ├── services/
-│   │   ├── summarization_service.py # Core pipeline (RAG → LLM → eval)
-│   │   └── rag_service.py           # ChromaDB vector store + retrieval
-│   │
-│   └── utils/
-│       ├── text_splitter.py         # Token counting + chunking
-│       └── evaluator.py             # Hallucination heuristic + length check
-│
-└── tests/
-    └── test_utils.py                # Unit tests (no OpenRouter key needed)
-```
-
----
-
-## Quick Start
-
-### 1. Clone and set up environment
-
-```bash
-# Create and activate a virtual environment
-python -m venv .venv
-
-# Windows
-.venv\Scripts\activate
-
-# macOS / Linux
-source .venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
-```
-
-### 2. Configure environment variables
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env` and set your OpenRouter API key:
-
-```
-OPENROUTER_API_KEY=sk-or-v1-...
-OPENROUTER_MODEL=openai/gpt-4o          # or anthropic/claude-3-haiku, google/gemini-pro
-CHUNK_MAX_TOKENS=3000
-```
-
-### 3. Start the server
-
-```bash
-uvicorn main:app --reload
-```
-
-The API will be available at **http://localhost:8000**
-
-### 4. Explore the interactive docs
-
-Open **http://localhost:8000/docs** in your browser for the full Swagger UI.
-
----
-
-## API Reference
-
-### `POST /api/v1/summarize`
-
-**Request body:**
-
-```json
-{
-  "article": "Raw financial news article text (min 50 characters)",
-  "extra_context": "Optional: additional guidance (e.g. 'focus on tech sector')"
-}
-```
-
-**Response:**
-
-```json
-{
-  "summary": "Concise summary ≤ 100 words",
-  "key_financial_insights": ["Insight 1", "Insight 2"],
-  "affected_companies_sectors": ["Apple Inc.", "Technology sector"],
-  "investor_implications": {
-    "direction": "bullish | bearish | neutral",
-    "rationale": "One-sentence rationale"
-  },
-  "rag_context_used": true,
-  "evaluation": {
-    "word_count": 72,
-    "within_limit": true,
-    "hallucination_risk": "low | medium | high",
-    "hallucination_flags": []
-  }
-}
-```
-
-**HTTP error codes:**
-
-| Code | Meaning |
-|------|---------|
-| 400  | Empty or invalid article input |
-| 422  | Request body schema validation failure |
-| 429  | OpenRouter rate limit exceeded |
-| 502  | OpenRouter API returned an error |
-| 503  | Cannot reach OpenRouter (network issue) |
-| 500  | Unexpected internal error |
-
-### `GET /health`
-
-Returns `{"status": "ok"}` — use for load-balancer health checks.
-
----
-
-## Run the Example Client
-
-```bash
-python example_request.py
-```
-
-See `EXAMPLE_RESPONSE.md` for a full sample response.
-
----
-
-## Run Tests
-
-Tests cover text splitting and evaluation utilities and require **no OpenRouter key**.
-
-```bash
-pytest tests/ -v
-```
-
----
+This project is a financial news intelligence platform. It fetches trusted
+financial news, deduplicates repeated stories, classifies each article, routes
+LLM calls through a free-tier fallback chain, checks summaries for hallucinated
+financial facts, stores results in PostgreSQL with pgvector, and serves both a
+live feed and a single-article summarizer.
 
 ## Architecture
 
-```
-POST /summarize
-      │
-      ▼
-  Pydantic validation (models.py)
-      │
-      ▼
-  RAGService.retrieve_context()        ← ChromaDB semantic search
-      │
-      ▼
-  count_tokens(article)
-      │
-   ┌──┴──────────────┐
-   │ ≤ 3000 tokens   │ > 3000 tokens
-   ▼                 ▼
- Single-pass      Chunked pass
- LLM call         (chunk → bullets → aggregate)
-   │                 │
-   └────────┬────────┘
-            ▼
-     JSON extraction + retry
-            │
-            ▼
-     evaluate_summary()        ← word count + hallucination heuristic
-            │
-            ▼
-     SummarizeResponse (Pydantic)
-```
+The most important idea is:
 
----
+**one schema, one pipeline, one database table, two entry points.**
 
-## Key Design Decisions
+Automated RSS/SEC articles and manually pasted articles enter the system from
+different places, but both use the same classification, summarization,
+evaluation, and storage logic.
 
-| Decision | Rationale |
-|---|---|
-| `temperature=0` for the LLM | Deterministic output is critical for financial data — reduces variance and hallucinations |
-| Paragraph-then-sentence chunking | Preserves semantic coherence better than fixed-size character splits |
-| Two-stage chunked pipeline (bullets → aggregate) | Avoids losing context; the aggregation step synthesizes across all segments |
-| JSON retry with repair prompt | Handles edge cases where the model wraps output in markdown fences |
-| Named entity + figure heuristic for hallucinations | Fast, zero-dependency check that catches the most dangerous hallucination pattern (fabricated numbers/names) |
-| ChromaDB persistent client | Embeddings survive restarts; no re-seeding cost after first run |
-| Local Embeddings for RAG | Cost-effective and offline default ChromaDB embeddings (all-MiniLM-L6-v2) |
+## Folder Guide
 
----
+- `ingestion/`: Fetches raw articles from RSS feeds and SEC EDGAR.
+- `processing/`: Orchestrates deduplication, classification, RAG, LLM calls,
+  JSON repair, hallucination evaluation, and storage.
+- `prompts/`: Provider-agnostic prompt templates.
+- `providers/`: The only place that imports Groq, NVIDIA, or Gemini SDKs.
+- `evaluator/`: Checks whether claimed numbers, tickers, and companies appear
+  in the source article.
+- `storage/`: PostgreSQL, pgvector, and Redis access.
+- `scheduler/`: Celery worker and Celery Beat schedule.
+- `api/`: FastAPI endpoints for `/api/feed` and `/api/summarize`.
+- `dashboard/`: Streamlit dashboards for feed and single-article usage.
 
-## Extending the System
+## Manual Setup
 
-**Add your own documents to the RAG knowledge base:**
+1. Install and start PostgreSQL.
+2. Create the database and enable pgvector:
 
-```python
-from app.services.rag_service import RAGService
-
-rag = RAGService()
-rag.add_documents(
-    texts=["Your financial document text here..."],
-    ids=["my_doc_001"],
-    metadatas=[{"topic": "your_topic"}]
-)
+```sql
+CREATE DATABASE financial_news_aggregator;
+\c financial_news_aggregator
+CREATE EXTENSION vector;
 ```
 
-**Change the model:**
+3. Install and start Redis. `redis-cli ping` should return `PONG`.
+4. Create free API keys for Groq, NVIDIA NIM, and Google AI Studio.
+5. Copy `.env.example` to `.env` and fill in all values.
+6. Create and activate a virtual environment.
+7. Install dependencies:
 
-Update `OPENROUTER_MODEL` in `.env`. The system supports any chat completion model available on OpenRouter.
+```bash
+pip install -r requirements.txt
+```
 
----
+8. Check your local setup:
 
-## Requirements
+```bash
+python setup_check.py
+```
 
-- Python 3.10+
-- OpenRouter API key
-- ~200MB disk space for ChromaDB + embeddings cache
+If this script prints `MISSING`, that item still needs your manual setup.
+
+## Run The API
+
+```bash
+uvicorn api.main:app --reload
+```
+
+Open `http://localhost:8000/docs` for the API docs.
+
+## Run Background Jobs
+
+In one terminal:
+
+```bash
+celery -A scheduler.worker.celery_app worker --loglevel=info
+```
+
+In another terminal:
+
+```bash
+celery -A scheduler.worker.celery_app beat --loglevel=info
+```
+
+## Run Dashboards
+
+```bash
+streamlit run dashboard/feed.py
+```
+
+or:
+
+```bash
+streamlit run dashboard/single.py
+```
+
+## Run Tests
+
+The tests cover the pieces that do not require live provider calls or running
+databases:
+
+```bash
+pytest
+```
+
+## Model Routing
+
+All LLM calls go through `providers/router.py`.
+
+- Cheap tasks: classification, chunk fact extraction, JSON repair.
+- Quality tasks: full summarization and long-document aggregation.
+
+This design lets the system survive free-tier rate limits by trying the next
+provider in the configured chain.
+
+## What You Must Do Manually
+
+I cannot create these for you from code:
+
+- Create real free API keys for Groq, NVIDIA NIM, and Google AI Studio.
+- Put those keys into `.env`.
+- Install and run PostgreSQL.
+- Create the database and enable `pgvector` if your DB user cannot do it.
+- Install and run Redis.
+- Optionally choose real SEC company CIKs in `SEC_TRACKED_CIKS`.
+
+Once those are done, the API, worker, scheduler, and dashboards are wired to run.
